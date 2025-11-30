@@ -50,10 +50,10 @@ You can use the available tools to interact with the application.`,
 export const Route = createFileRoute('/api/mcp')({
   server: {
     handlers: {
-      POST: async ({ request }) => {
+      GET: async ({ request }) => {
         return mcp.handleRequest(request)
       },
-      GET: async ({ request }) => {
+      POST: async ({ request }) => {
         return mcp.handleRequest(request)
       },
     },
@@ -76,10 +76,10 @@ import { createFileRoute } from '@tanstack/react-router'
 export const Route = createFileRoute('/api/mcp')({
   server: {
     handlers: {
-      POST: async ({ request }) => {
+      GET: async ({ request }) => {
         return mcp.handleRequest(request)
       },
-      GET: async ({ request }) => {
+      POST: async ({ request }) => {
         return mcp.handleRequest(request)
       },
     },
@@ -152,8 +152,8 @@ const authenticatedHandler = withMcpAuth(
 export const Route = createFileRoute('/api/mcp')({
   server: {
     handlers: {
-      POST: authenticatedHandler,
       GET: authenticatedHandler,
+      POST: authenticatedHandler,
     },
   },
 })
