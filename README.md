@@ -72,7 +72,6 @@ The API route is where your MCP server lives. It handles both POST (for JSON-RPC
 ```typescript
 // src/routes/api/mcp.ts
 import { createFileRoute } from '@tanstack/react-router'
-import { mcp } from '../../mcp'
 
 export const Route = createFileRoute('/api/mcp')({
   server: {
@@ -93,15 +92,11 @@ export const Route = createFileRoute('/api/mcp')({
 The MCP server manages your tools and handles the protocol communication:
 
 ```typescript
-// src/mcp/index.ts
-import { createMcpServer } from 'mcp-tanstack-start'
-import { echoTool, weatherTool } from './tools'
-
-export const mcp = createMcpServer({
+const mcp = createMcpServer({
   name: 'my-tanstack-app',      // Server name
   version: '1.0.0',              // Server version
   instructions: `Optional instructions for AI assistants about how to use your tools.`,
-  tools: [echoTool, weatherTool], // Array of tools
+  tools: [echoTool],             // Array of tools
 })
 ```
 
@@ -110,106 +105,22 @@ export const mcp = createMcpServer({
 Tools are the functions that LLMs can call. Each tool has a name, description, parameters (defined with Zod), and an execute function:
 
 ```typescript
-// src/mcp/tools/weather.ts
 import { defineTool } from 'mcp-tanstack-start'
 import { z } from 'zod'
 
-export const weatherTool = defineTool({
-  name: 'get_weather',
-  description: 'Get current weather for a location',
+const echoTool = defineTool({
+  name: 'echo',
+  description: 'Echo back a message',
   parameters: z.object({
-    city: z.string().describe('City name'),
-    units: z.enum(['celsius', 'fahrenheit']).optional().default('celsius'),
+    message: z.string().describe('The message to echo back'),
   }),
-  execute: async ({ city, units }) => {
-    // Your logic here
-    const temp = 72
-    const unit = units === 'fahrenheit' ? 'F' : 'C'
-    return `The weather in ${city} is ${temp}°${unit}`
+  execute: async ({ message }) => {
+    return `You said: ${message}`
   },
 })
 ```
 
 The `parameters` object uses Zod schemas for type-safe validation. The `execute` function receives the validated parameters and returns a string response.
-
-## Adding Multiple Tools
-
-You can add as many tools as you need:
-
-```typescript
-// src/mcp/tools/search.ts
-import { defineTool } from 'mcp-tanstack-start'
-import { z } from 'zod'
-
-export const searchTool = defineTool({
-  name: 'search',
-  description: 'Search the knowledge base',
-  parameters: z.object({
-    query: z.string().describe('Search query'),
-    limit: z.number().optional().default(10).describe('Maximum results'),
-  }),
-  execute: async ({ query, limit }) => {
-    const results = await searchDatabase(query, limit)
-    return JSON.stringify(results)
-  },
-})
-```
-
-```typescript
-// src/mcp/tools/calculate.ts
-import { defineTool } from 'mcp-tanstack-start'
-import { z } from 'zod'
-
-export const calculateTool = defineTool({
-  name: 'calculate',
-  description: 'Perform mathematical calculations',
-  parameters: z.object({
-    expression: z.string().describe('Math expression to evaluate'),
-  }),
-  execute: async ({ expression }) => {
-    const result = evaluate(expression)
-    return `Result: ${result}`
-  },
-})
-```
-
-Add them all to your server:
-
-```typescript
-// src/mcp/index.ts
-import { createMcpServer } from 'mcp-tanstack-start'
-import { weatherTool } from './tools/weather'
-import { searchTool } from './tools/search'
-import { calculateTool } from './tools/calculate'
-
-export const mcp = createMcpServer({
-  name: 'my-tanstack-app',
-  version: '1.0.0',
-  tools: [weatherTool, searchTool, calculateTool],
-})
-```
-
-## Rich Content Responses
-
-Return different content types from your tools:
-
-```typescript
-import { defineTool, text, image } from 'mcp-tanstack-start'
-import { z } from 'zod'
-
-const screenshotTool = defineTool({
-  name: 'take_screenshot',
-  description: 'Capture a screenshot of a URL',
-  parameters: z.object({ url: z.string().url() }),
-  execute: async ({ url }) => {
-    const imageData = await captureScreenshot(url)
-    return [
-      text(`Screenshot of ${url}`),
-      image(imageData, 'image/png'),
-    ]
-  },
-})
-```
 
 ## Authentication
 
