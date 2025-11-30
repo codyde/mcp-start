@@ -37,6 +37,12 @@ export interface WebStandardTransportOptions {
    * Default: 30000 (30 seconds)
    */
   requestTimeout?: number;
+
+  /**
+   * Session timeout in milliseconds. Sessions inactive for this duration will be cleaned up.
+   * Default: 300000 (5 minutes)
+   */
+  sessionTimeout?: number;
 }
 
 /**
@@ -49,6 +55,34 @@ interface PendingBatch {
   expectedCount: number;
   timeoutId: ReturnType<typeof setTimeout>;
   resolved: boolean;
+  sessionId: string;
+}
+
+/**
+ * Session state for a single MCP client session
+ */
+interface Session {
+  id: string;
+  initialized: boolean;
+  initializing: boolean;
+  sseController: ReadableStreamDefaultController<Uint8Array> | null;
+  sseStreamActive: boolean;
+  pendingBatches: Map<string, PendingBatch>;
+  requestToBatch: Map<string | number, string>;
+  lastActivity: number;
+  timeoutId?: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Generate a cryptographically secure session ID
+ */
+function generateSessionId(): string {
+  // Use crypto.randomUUID if available (modern runtimes)
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  // Fallback for older environments
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
 }
 
 /**
@@ -56,6 +90,9 @@ interface PendingBatch {
  *
  * This transport implements the MCP Streamable HTTP specification using
  * Web Standard APIs (Request/Response) instead of Node.js http module.
+ *
+ * Supports proper session management via Mcp-Session-Id header as per the spec:
+ * https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
  *
  * Designed for modern JavaScript runtimes and frameworks like:
  * - TanStack Start
@@ -67,25 +104,20 @@ interface PendingBatch {
  */
 export class WebStandardTransport implements Transport {
   private _started = false;
-  private _initializing = false;
-  private _initialized = false;
   private _enableJsonResponse: boolean;
   private _maxBodySize: number;
   private _maxBatchSize: number;
   private _requestTimeout: number;
+  private _sessionTimeout: number;
 
   // Current request options (auth, signal, etc.)
   private _currentOptions?: McpRequestOptions;
 
-  // Pending batches waiting for responses
-  private _pendingBatches = new Map<string, PendingBatch>();
+  // Session management - keyed by session ID
+  private _sessions = new Map<string, Session>();
 
-  // Map request IDs to their batch ID for fast lookup
-  private _requestToBatch = new Map<string | number, string>();
-
-  // SSE stream for server-to-client notifications (GET endpoint)
-  private _sseController: ReadableStreamDefaultController<Uint8Array> | null = null;
-  private _sseStreamActive = false;
+  // Current session ID being processed (set during request handling)
+  private _currentSessionId?: string;
 
   // Transport callbacks (set by the SDK when connecting)
   onclose?: () => void;
@@ -97,6 +129,7 @@ export class WebStandardTransport implements Transport {
     this._maxBodySize = options.maxBodySize ?? 1048576; // 1MB default
     this._maxBatchSize = options.maxBatchSize ?? 100;
     this._requestTimeout = options.requestTimeout ?? 30000; // 30 seconds default
+    this._sessionTimeout = options.sessionTimeout ?? 300000; // 5 minutes default
   }
 
   /**
@@ -117,14 +150,104 @@ export class WebStandardTransport implements Transport {
   }
 
   /**
-   * Close the transport and clean up resources.
+   * Close the transport and clean up all sessions.
    */
   async close(): Promise<void> {
-    // Close SSE stream if active
-    this.cleanupSseStream();
+    // Clean up all sessions
+    for (const session of this._sessions.values()) {
+      this.cleanupSession(session);
+    }
+    this._sessions.clear();
+
+    this.onclose?.();
+  }
+
+  /**
+   * Create a new session
+   */
+  private createSession(): Session {
+    const id = generateSessionId();
+    const session: Session = {
+      id,
+      initialized: false,
+      initializing: false,
+      sseController: null,
+      sseStreamActive: false,
+      pendingBatches: new Map(),
+      requestToBatch: new Map(),
+      lastActivity: Date.now(),
+    };
+
+    // Set up session timeout
+    session.timeoutId = setTimeout(() => {
+      this.terminateSession(id);
+    }, this._sessionTimeout);
+
+    this._sessions.set(id, session);
+    return session;
+  }
+
+  /**
+   * Get a session by ID, or return null if not found
+   */
+  private getSession(sessionId: string): Session | null {
+    const session = this._sessions.get(sessionId);
+    if (session) {
+      // Reset the session timeout on activity
+      this.refreshSessionTimeout(session);
+    }
+    return session ?? null;
+  }
+
+  /**
+   * Refresh the session timeout
+   */
+  private refreshSessionTimeout(session: Session): void {
+    session.lastActivity = Date.now();
+    if (session.timeoutId) {
+      clearTimeout(session.timeoutId);
+    }
+    session.timeoutId = setTimeout(() => {
+      this.terminateSession(session.id);
+    }, this._sessionTimeout);
+  }
+
+  /**
+   * Terminate a session and clean up resources
+   */
+  terminateSession(sessionId: string): boolean {
+    const session = this._sessions.get(sessionId);
+    if (!session) {
+      return false;
+    }
+
+    this.cleanupSession(session);
+    this._sessions.delete(sessionId);
+    return true;
+  }
+
+  /**
+   * Clean up session resources
+   */
+  private cleanupSession(session: Session): void {
+    // Clear timeout
+    if (session.timeoutId) {
+      clearTimeout(session.timeoutId);
+    }
+
+    // Close SSE stream
+    if (session.sseController) {
+      try {
+        session.sseController.close();
+      } catch {
+        // May already be closed
+      }
+      session.sseController = null;
+    }
+    session.sseStreamActive = false;
 
     // Reject any pending batches
-    for (const batch of this._pendingBatches.values()) {
+    for (const batch of session.pendingBatches.values()) {
       if (!batch.resolved) {
         clearTimeout(batch.timeoutId);
         batch.resolved = true;
@@ -132,36 +255,31 @@ export class WebStandardTransport implements Transport {
           new Response(
             JSON.stringify({
               jsonrpc: "2.0",
-              error: { code: -32000, message: "Transport closed" },
+              error: { code: -32000, message: "Session terminated" },
               id: null,
             }),
             { status: 500, headers: { "Content-Type": "application/json" } }
           )
         );
       }
-      // Clean up request-to-batch mappings
-      for (const reqId of batch.requestIds) {
-        this._requestToBatch.delete(reqId);
-      }
     }
-    this._pendingBatches.clear();
-
-    this.onclose?.();
+    session.pendingBatches.clear();
+    session.requestToBatch.clear();
   }
 
   /**
-   * Clean up SSE stream resources
+   * Clean up SSE stream for a session
    */
-  private cleanupSseStream(): void {
-    if (this._sseController) {
+  private cleanupSseStream(session: Session): void {
+    if (session.sseController) {
       try {
-        this._sseController.close();
+        session.sseController.close();
       } catch {
         // May already be closed
       }
-      this._sseController = null;
+      session.sseController = null;
     }
-    this._sseStreamActive = false;
+    session.sseStreamActive = false;
   }
 
   /**
@@ -172,30 +290,37 @@ export class WebStandardTransport implements Transport {
     // If it's a response/error, find the pending batch and add the response
     if (isJSONRPCResponse(message) || isJSONRPCError(message)) {
       const requestId = message.id;
-      const batchId = this._requestToBatch.get(requestId);
 
-      if (batchId) {
-        const batch = this._pendingBatches.get(batchId);
+      // Search all sessions for this request
+      for (const session of this._sessions.values()) {
+        const batchId = session.requestToBatch.get(requestId);
+        if (batchId) {
+          const batch = session.pendingBatches.get(batchId);
+          if (batch && !batch.resolved) {
+            batch.responses.set(requestId, message);
 
-        if (batch && !batch.resolved) {
-          batch.responses.set(requestId, message);
-
-          // Check if we have all expected responses
-          if (batch.responses.size >= batch.expectedCount) {
-            this.resolveBatch(batchId, batch);
+            // Check if we have all expected responses
+            if (batch.responses.size >= batch.expectedCount) {
+              this.resolveBatch(session, batchId, batch);
+            }
           }
+          return;
         }
       }
       return;
     }
 
     // For notifications/requests from server, send on SSE stream if available
-    if (this._sseController && this._sseStreamActive) {
-      try {
-        const sseEvent = `event: message\ndata: ${JSON.stringify(message)}\n\n`;
-        this._sseController.enqueue(new TextEncoder().encode(sseEvent));
-      } catch {
-        // Stream may have been closed
+    // Use current session if set, otherwise broadcast to all active streams
+    if (this._currentSessionId) {
+      const session = this._sessions.get(this._currentSessionId);
+      if (session?.sseController && session.sseStreamActive) {
+        try {
+          const sseEvent = `event: message\ndata: ${JSON.stringify(message)}\n\n`;
+          session.sseController.enqueue(new TextEncoder().encode(sseEvent));
+        } catch {
+          // Stream may have been closed
+        }
       }
     }
   }
@@ -203,7 +328,7 @@ export class WebStandardTransport implements Transport {
   /**
    * Resolve a pending batch with all its responses
    */
-  private resolveBatch(batchId: string, batch: PendingBatch): void {
+  private resolveBatch(session: Session, batchId: string, batch: PendingBatch): void {
     if (batch.resolved) return;
 
     batch.resolved = true;
@@ -211,9 +336,9 @@ export class WebStandardTransport implements Transport {
 
     // Clean up mappings
     for (const reqId of batch.requestIds) {
-      this._requestToBatch.delete(reqId);
+      session.requestToBatch.delete(reqId);
     }
-    this._pendingBatches.delete(batchId);
+    session.pendingBatches.delete(batchId);
 
     // Build response array in original request order
     const responses: JSONRPCMessage[] = [];
@@ -222,6 +347,12 @@ export class WebStandardTransport implements Transport {
       if (response) {
         responses.push(response);
       }
+    }
+
+    // Add session ID header to response
+    const headers: Record<string, string> = {};
+    if (batch.sessionId) {
+      headers["Mcp-Session-Id"] = batch.sessionId;
     }
 
     if (this._enableJsonResponse) {
@@ -234,7 +365,7 @@ export class WebStandardTransport implements Transport {
       batch.resolve(
         new Response(body, {
           status: 200,
-          headers: { "Content-Type": "application/json" },
+          headers: { ...headers, "Content-Type": "application/json" },
         })
       );
     } else {
@@ -247,6 +378,7 @@ export class WebStandardTransport implements Transport {
         new Response(sseData, {
           status: 200,
           headers: {
+            ...headers,
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
             Connection: "keep-alive",
@@ -273,21 +405,59 @@ export class WebStandardTransport implements Transport {
         return await this.handlePostRequest(request);
       }
 
+      if (request.method === "DELETE") {
+        return await this.handleDeleteRequest(request);
+      }
+
       return new Response(
         JSON.stringify({
           jsonrpc: "2.0",
-          error: { code: -32000, message: "Method not allowed. Use GET or POST." },
+          error: { code: -32000, message: "Method not allowed. Use GET, POST, or DELETE." },
           id: null,
         }),
         {
           status: 405,
-          headers: { "Content-Type": "application/json", Allow: "GET, POST" },
+          headers: { "Content-Type": "application/json", Allow: "GET, POST, DELETE" },
         }
       );
     } finally {
       // Clear options after request is handled
       this._currentOptions = undefined;
+      this._currentSessionId = undefined;
     }
+  }
+
+  /**
+   * Handle DELETE requests to terminate a session
+   */
+  private async handleDeleteRequest(request: Request): Promise<Response> {
+    const sessionId = request.headers.get("mcp-session-id");
+
+    if (!sessionId) {
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Bad Request: Missing Mcp-Session-Id header" },
+          id: null,
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    const terminated = this.terminateSession(sessionId);
+
+    if (!terminated) {
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Not Found: Session does not exist" },
+          id: null,
+        }),
+        { status: 404, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    return new Response(null, { status: 204 });
   }
 
   /**
@@ -295,6 +465,7 @@ export class WebStandardTransport implements Transport {
    */
   private async handleGetRequest(request: Request): Promise<Response> {
     const acceptHeader = request.headers.get("accept") || "";
+    const sessionId = request.headers.get("mcp-session-id");
 
     // Must accept text/event-stream
     if (!this.acceptsMediaType(acceptHeader, "text/event-stream")) {
@@ -311,37 +482,61 @@ export class WebStandardTransport implements Transport {
       );
     }
 
-    // Only one SSE stream allowed at a time
-    if (this._sseStreamActive) {
+    // Session ID is required for GET requests (after initialization)
+    if (!sessionId) {
       return new Response(
         JSON.stringify({
           jsonrpc: "2.0",
           error: {
             code: -32000,
-            message: "Conflict: Only one SSE stream is allowed per session",
+            message: "Bad Request: Missing Mcp-Session-Id header",
           },
           id: null,
         }),
-        { status: 409, headers: { "Content-Type": "application/json" } }
+        { status: 400, headers: { "Content-Type": "application/json" } }
       );
+    }
+
+    const session = this.getSession(sessionId);
+    if (!session) {
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          error: {
+            code: -32000,
+            message: "Not Found: Session does not exist or has expired",
+          },
+          id: null,
+        }),
+        { status: 404, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    // Set current session for message routing
+    this._currentSessionId = sessionId;
+
+    // If there's already an active SSE stream for this session, close it and start fresh
+    // This handles reconnection scenarios
+    if (session.sseStreamActive) {
+      this.cleanupSseStream(session);
     }
 
     // Create SSE stream
     const stream = new ReadableStream<Uint8Array>({
       start: (controller) => {
-        this._sseController = controller;
-        this._sseStreamActive = true;
+        session.sseController = controller;
+        session.sseStreamActive = true;
       },
       cancel: () => {
-        this.cleanupSseStream();
+        this.cleanupSseStream(session);
       },
     });
 
-    // Handle client disconnect via abort signal (using once: true for auto-cleanup)
+    // Handle client disconnect via abort signal
     request.signal.addEventListener(
       "abort",
       () => {
-        this.cleanupSseStream();
+        this.cleanupSseStream(session);
       },
       { once: true }
     );
@@ -352,6 +547,7 @@ export class WebStandardTransport implements Transport {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache, no-transform",
         Connection: "keep-alive",
+        "Mcp-Session-Id": sessionId,
       },
     });
   }
@@ -494,6 +690,9 @@ export class WebStandardTransport implements Transport {
 
     // Check for initialization request
     const isInitializationRequest = messages.some(isInitializeRequest);
+    const requestSessionId = request.headers.get("mcp-session-id");
+
+    let session: Session;
 
     if (isInitializationRequest) {
       // Only allow single initialization request
@@ -511,14 +710,23 @@ export class WebStandardTransport implements Transport {
         );
       }
 
-      // Prevent re-initialization with atomic check
-      if (this._initialized || this._initializing) {
+      // Create a new session for initialization
+      // If there was an old session ID provided, terminate it first
+      if (requestSessionId) {
+        this.terminateSession(requestSessionId);
+      }
+
+      session = this.createSession();
+      session.initializing = true;
+    } else {
+      // Non-initialization requests require a session ID
+      if (!requestSessionId) {
         return new Response(
           JSON.stringify({
             jsonrpc: "2.0",
             error: {
-              code: -32600,
-              message: "Invalid Request: Server already initialized",
+              code: -32000,
+              message: "Bad Request: Missing Mcp-Session-Id header",
             },
             id: null,
           }),
@@ -526,8 +734,23 @@ export class WebStandardTransport implements Transport {
         );
       }
 
-      this._initializing = true;
-    } else {
+      const existingSession = this.getSession(requestSessionId);
+      if (!existingSession) {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            error: {
+              code: -32000,
+              message: "Not Found: Session does not exist or has expired",
+            },
+            id: null,
+          }),
+          { status: 404, headers: { "Content-Type": "application/json" } }
+        );
+      }
+
+      session = existingSession;
+
       // Validate protocol version for non-initialization requests
       const protocolVersion = request.headers.get("mcp-protocol-version");
       if (protocolVersion && !SUPPORTED_PROTOCOL_VERSIONS.includes(protocolVersion)) {
@@ -545,6 +768,9 @@ export class WebStandardTransport implements Transport {
       }
     }
 
+    // Set current session for message routing
+    this._currentSessionId = session.id;
+
     // Check if the batch contains requests (not just notifications)
     const requests = messages.filter(isJSONRPCRequest);
     const hasRequests = requests.length > 0;
@@ -557,11 +783,14 @@ export class WebStandardTransport implements Transport {
 
       // Mark as initialized if this was an initialization
       if (isInitializationRequest) {
-        this._initialized = true;
-        this._initializing = false;
+        session.initialized = true;
+        session.initializing = false;
       }
 
-      return new Response(null, { status: 202 });
+      return new Response(null, {
+        status: 202,
+        headers: { "Mcp-Session-Id": session.id },
+      });
     }
 
     // Create a promise that will resolve when we have all responses
@@ -571,15 +800,15 @@ export class WebStandardTransport implements Transport {
 
       // Set up timeout
       const timeoutId = setTimeout(() => {
-        const batch = this._pendingBatches.get(batchId);
+        const batch = session.pendingBatches.get(batchId);
         if (batch && !batch.resolved) {
           batch.resolved = true;
 
           // Clean up mappings
           for (const reqId of batch.requestIds) {
-            this._requestToBatch.delete(reqId);
+            session.requestToBatch.delete(reqId);
           }
-          this._pendingBatches.delete(batchId);
+          session.pendingBatches.delete(batchId);
 
           // Build timeout response including any responses we did receive
           const responses: JSONRPCMessage[] = [];
@@ -605,7 +834,10 @@ export class WebStandardTransport implements Transport {
           resolve(
             new Response(body, {
               status: 408,
-              headers: { "Content-Type": "application/json" },
+              headers: {
+                "Content-Type": "application/json",
+                "Mcp-Session-Id": session.id,
+              },
             })
           );
         }
@@ -620,13 +852,14 @@ export class WebStandardTransport implements Transport {
         expectedCount: requests.length,
         timeoutId,
         resolved: false,
+        sessionId: session.id,
       };
 
-      this._pendingBatches.set(batchId, batch);
+      session.pendingBatches.set(batchId, batch);
 
       // Map each request ID to this batch
       for (const reqId of requestIds) {
-        this._requestToBatch.set(reqId, batchId);
+        session.requestToBatch.set(reqId, batchId);
       }
 
       // Dispatch messages to the MCP server
@@ -636,9 +869,20 @@ export class WebStandardTransport implements Transport {
 
       // Mark as initialized after dispatching if this was initialization
       if (isInitializationRequest) {
-        this._initialized = true;
-        this._initializing = false;
+        session.initialized = true;
+        session.initializing = false;
       }
     });
+  }
+
+  /**
+   * Reset session state for a new connection (deprecated - use session management instead).
+   * Kept for backwards compatibility but now just cleans up all sessions.
+   */
+  resetSession(): void {
+    for (const session of this._sessions.values()) {
+      this.cleanupSession(session);
+    }
+    this._sessions.clear();
   }
 }
