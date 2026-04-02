@@ -66,20 +66,74 @@ export function createMcpServer(config: McpServerConfig): McpServerInstance {
   };
 }
 
+function isZodSchemaLike(value: unknown): value is z.ZodType {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    ("_def" in value ||
+      "_zod" in value ||
+      typeof (value as { safeParse?: unknown }).safeParse === "function")
+  );
+}
+
 /**
- * Extract raw shape from a Zod object schema.
- *
- * Note: This accesses Zod's internal `_def` property which is not part of the
- * public API. While this works with current Zod versions (3.x), it may break
- * in future major versions. Consider using the `zod-to-json-schema` package
- * for more robust schema conversion if you encounter issues.
+ * Plain object whose values are Zod field schemas — the MCP SDK accepts this as
+ * a tool input shape (same as `z.object({ ... }).shape`).
  */
-function extractZodShape(schema: z.ZodType): Record<string, z.ZodType> | undefined {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const def = schema._def as any;
-  if (def?.typeName === "ZodObject") {
-    return def.shape();
+function isZodRawShape(value: unknown): value is Record<string, z.ZodType> {
+  if (!value || typeof value !== "object" || isZodSchemaLike(value)) {
+    return false;
   }
+  const vals = Object.values(value);
+  if (vals.length === 0) return false;
+  return vals.every(isZodSchemaLike);
+}
+
+/**
+ * Extract raw shape for MCP tool registration from:
+ * - A Zod object schema (`z.object({ ... })`)
+ * - A raw shape object (`{ foo: z.string() }`)
+ *
+ * Covers Zod 3 (`_def.typeName === "ZodObject"`), Zod 4 classic-style objects,
+ * and bundlers where only the public `.shape` getter is reliable.
+ */
+function extractZodShape(schema: unknown): Record<string, z.ZodType> | undefined {
+  if (isZodRawShape(schema)) {
+    return schema;
+  }
+
+  if (!isZodSchemaLike(schema)) {
+    return undefined;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const def = (schema as z.ZodType & { shape?: Record<string, z.ZodType> })._def as any;
+
+  if (def?.typeName === "ZodObject" && typeof def.shape === "function") {
+    return def.shape() as Record<string, z.ZodType>;
+  }
+
+  if (def?.type === "object") {
+    const sh = def.shape;
+    if (typeof sh === "function") return sh() as Record<string, z.ZodType>;
+    if (sh && typeof sh === "object") return sh as Record<string, z.ZodType>;
+  }
+
+  const { shape } = schema as z.ZodType & { shape?: unknown };
+  if (shape && typeof shape === "object") {
+    const vals = Object.values(shape as Record<string, unknown>);
+    if (
+      vals.some(
+        (v) =>
+          v &&
+          typeof v === "object" &&
+          isZodSchemaLike(v)
+      )
+    ) {
+      return shape as Record<string, z.ZodType>;
+    }
+  }
+
   return undefined;
 }
 
