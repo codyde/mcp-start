@@ -42,7 +42,10 @@ export interface ToolDefinition<TParams extends z.ZodType = z.ZodType> {
   name: string;
   /** Human-readable description of what the tool does */
   description: string;
-  /** Zod schema for the tool's parameters */
+  /**
+   * Tool parameters: typically `z.object({ ... })`, or a raw shape object
+   * `{ key: z.string(), ... }` (same as `.shape` on a Zod object).
+   */
   parameters: TParams;
   /** Function that executes the tool */
   execute: (
